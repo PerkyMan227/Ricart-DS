@@ -57,14 +57,6 @@ const (
 	HELD
 )
 
-// This for incrementing own clock
-func (n *Node) incrementClock() int64 {
-	n.mu.Lock()
-	n.clock++
-	n.mu.Unlock()
-	return n.clock
-}
-
 // This for updating own clock with recieved clock from other proccess + 1
 func (n *Node) updateClock(recievedTime int64) {
 	n.mu.Lock()
@@ -99,18 +91,13 @@ func (n *Node) RequestAccess(ctx context.Context, req *pro.Request) (*pro.Reply,
 	}
 
 	if needToReply {
+		n.clock++
 		return &pro.Reply{NodeId: n.id, Timestamp: n.clock}, nil
 	}
 
 	return nil, status.Error(codes.Unavailable, "Request deferred")
 
 }
-
-func (n *Node) ReleaseAccess(ctx context.Context, req *pro.Release) (*pro.Ack, error) {
-	log.Printf("[Node %d] - Received release notification from Node %d", n.id, req.NodeId)
-	return &pro.Ack{Success: true}, nil
-}
-
 func (n *Node) RequestCS() {
 
 	//Change state to wanted
@@ -154,8 +141,6 @@ func (n *Node) ReleaseCS() {
 	n.mu.Lock()
 	log.Printf("[Node %d] - LEAVING Critical section", n.id)
 	n.state = RELEASED
-	deferredCopy := make([]int32, len(n.deferredQueue))
-	copy(deferredCopy, n.deferredQueue)
 	n.deferredQueue = []int32{}
 	n.mu.Unlock()
 }
@@ -196,38 +181,6 @@ func (n *Node) sendRequest(peerID int32, peerAddr string) {
 		time.Sleep(100 * time.Millisecond)
 	}
 }
-
-/*
-func (n *Node) sendDeferredReply(nodeID int32) {
-	addr, ok := n.peers[nodeID]
-	if !ok {
-		log.Printf("[Node %d] - Unknown peer ID %d in deferred queue", n.id, nodeID)
-		return
-	}
-
-	creds := insecure.NewCredentials()
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
-	if err != nil {
-		log.Printf("[Node %d] - Failed to connect to Node %d for deferred reply: %v", n.id, nodeID, err)
-		return
-	}
-	defer conn.Close()
-
-	client := pro.NewMutualExclusionClient(conn)
-
-	n.mu.Lock()
-	timestamp := n.clock
-	n.mu.Unlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// Send the deferred reply as a new request that will be immediately granted
-	_, err = client.RequestAccess(ctx, &pro.Request{NodeId: n.id, Timestamp: timestamp})
-
-	log.Printf("[Node %d] - Sent deferred reply to Node %d", n.id, nodeID)
-}
-*/
 
 // EnterCriticalSection simulates work in the critical section, whatever that may be...
 func (n *Node) EnterCriticalSection() {
