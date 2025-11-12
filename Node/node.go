@@ -24,6 +24,29 @@ type Node struct {
 	replies       []int32          // Nodes that sent OK
 	deferredQueue []int32          // Requests to reply to later
 	mu            sync.Mutex       // Protects shared state
+	pro.UnimplementedMutualExclusionServer
+}
+
+func NewNode(id int32, address string, peers map[int32]string) *Node {
+	return &Node{
+		id:            id,
+		address:       address,
+		clock:         0,
+		state:         RELEASED,
+		peers:         peers,
+		replies:       []int32{},
+		deferredQueue: []int32{},
+	}
+}
+
+// ID returns the node's ID (exported getter)
+func (n *Node) ID() int32 {
+	return n.id
+}
+
+// Address returns the node's address (exported getter)
+func (n *Node) Address() string {
+	return n.address
 }
 
 type NodeState int
@@ -62,7 +85,7 @@ func (n *Node) RequestAccess(ctx context.Context, req *pro.Request) (*pro.Reply,
 	if n.state == RELEASED {
 		needToReply = true
 	} else if n.state == WANTED {
-		// Check priority
+		// Check priority: lower timestamp wins and ties broken by lower node ID
 		if req.Timestamp < n.requestTime {
 			needToReply = true
 		} else if (req.Timestamp == n.requestTime) && (req.NodeId < n.id) {
@@ -79,8 +102,13 @@ func (n *Node) RequestAccess(ctx context.Context, req *pro.Request) (*pro.Reply,
 		return &pro.Reply{NodeId: n.id, Timestamp: n.clock}, nil
 	}
 
-	return nil, status.Error(codes.Unavailable, "Request deffered")
+	return nil, status.Error(codes.Unavailable, "Request deferred")
 
+}
+
+func (n *Node) ReleaseAccess(ctx context.Context, req *pro.Release) (*pro.Ack, error) {
+	log.Printf("[Node %d] - Received release notification from Node %d", n.id, req.NodeId)
+	return &pro.Ack{Success: true}, nil
 }
 
 func (n *Node) RequestCS() {
@@ -88,7 +116,8 @@ func (n *Node) RequestCS() {
 	//Change state to wanted
 	n.mu.Lock()
 	n.state = WANTED
-	n.requestTime = n.incrementClock()
+	n.clock++
+	n.requestTime = n.clock
 	n.replies = []int32{}
 	n.mu.Unlock()
 
@@ -105,6 +134,7 @@ func (n *Node) RequestCS() {
 		}(peerID, peerAddress)
 	}
 
+	//Wait for replies
 	for {
 		n.mu.Lock()
 		if len(n.replies) == len(n.peers) {
@@ -116,16 +146,31 @@ func (n *Node) RequestCS() {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	log.Printf("[Node %d] - ENTERING Critical State", n.id)
+	log.Printf("[Node %d] - ENTERING Critical section", n.id)
 
 }
 
+func (n *Node) ReleaseCS() {
+	n.mu.Lock()
+	log.Printf("[Node %d] - LEAVING Critical section", n.id)
+	n.state = RELEASED
+	deferredCopy := make([]int32, len(n.deferredQueue))
+	copy(deferredCopy, n.deferredQueue)
+	n.deferredQueue = []int32{}
+	n.mu.Unlock()
+}
+
 func (n *Node) sendRequest(peerID int32, peerAddr string) {
+
+	log.Printf("[Node %d] - Attempting to send request to Node %d at %s", n.id, peerID, peerAddr)
+
 	creds := insecure.NewCredentials()
 	conn, err := grpc.NewClient(peerAddr, grpc.WithTransportCredentials(creds))
 	if err != nil {
+		log.Printf("[Node %d] - Failed to connect to Node %d: %v", n.id, peerID, err)
 		return
 	}
+	defer conn.Close()
 
 	client := pro.NewMutualExclusionClient(conn)
 
@@ -133,19 +178,62 @@ func (n *Node) sendRequest(peerID int32, peerAddr string) {
 	timestamp := n.requestTime
 	n.mu.Unlock()
 
-	reply, err := client.RequestAccess(context.Background(), &pro.Request{NodeId: n.id, Timestamp: timestamp})
+	// Keep retrying until we get a reply (handles deferred requests)
+	for {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		reply, err := client.RequestAccess(ctx, &pro.Request{NodeId: n.id, Timestamp: timestamp})
+		cancel()
 
-	if err == nil {
-		n.mu.Lock()
-		n.replies = append(n.replies, reply.NodeId)
-		n.mu.Unlock()
-		log.Printf("[Node %d] - Recived OK from Node %d", n.id, peerID)
+		if err == nil && reply != nil {
+			n.mu.Lock()
+			n.replies = append(n.replies, reply.NodeId)
+			n.mu.Unlock()
+			log.Printf("[Node %d] - Received OK from Node %d", n.id, peerID)
+			return
+		}
+
+		// Request was deferred, wait a bit and retry
+		time.Sleep(100 * time.Millisecond)
 	}
 }
 
+/*
 func (n *Node) sendDeferredReply(nodeID int32) {
-	// Change state to RELEASED
-	// Send OK to all nodes in deferred queue
-	// Clear deffered queeue
-	// How you may ask. Fuck if i know...
+	addr, ok := n.peers[nodeID]
+	if !ok {
+		log.Printf("[Node %d] - Unknown peer ID %d in deferred queue", n.id, nodeID)
+		return
+	}
+
+	creds := insecure.NewCredentials()
+	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(creds))
+	if err != nil {
+		log.Printf("[Node %d] - Failed to connect to Node %d for deferred reply: %v", n.id, nodeID, err)
+		return
+	}
+	defer conn.Close()
+
+	client := pro.NewMutualExclusionClient(conn)
+
+	n.mu.Lock()
+	timestamp := n.clock
+	n.mu.Unlock()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Send the deferred reply as a new request that will be immediately granted
+	_, err = client.RequestAccess(ctx, &pro.Request{NodeId: n.id, Timestamp: timestamp})
+
+	log.Printf("[Node %d] - Sent deferred reply to Node %d", n.id, nodeID)
+}
+*/
+
+// EnterCriticalSection simulates work in the critical section, whatever that may be...
+func (n *Node) EnterCriticalSection() {
+	log.Printf("========================================================")
+	log.Printf("[Node %d] ====== PERFORMING CRITICAL SECTION WORK ======", n.id)
+	time.Sleep(2 * time.Second) // Simulate some work
+	log.Printf("[Node %d] ======  CRITICAL SECTION WORK COMPLETE  ======", n.id)
+	log.Printf("========================================================")
 }
