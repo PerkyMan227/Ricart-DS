@@ -9,21 +9,24 @@ import (
 	pro "ricart/proto"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
+
+type deferredRequest struct {
+	nodeId  int32
+	replyCh chan *pro.Reply
+}
 
 type Node struct {
 	id            int32
 	address       string
-	clock         int64            // Lamport logical clock
-	state         NodeState        // RELEASED, WANTED, HELD
-	requestTime   int64            // Timestamp when CS was requested
-	peers         map[int32]string // Other nodes' addresses
-	replies       []int32          // Nodes that sent OK
-	deferredQueue []int32          // Requests to reply to later
-	mu            sync.Mutex       // Protects shared state
+	clock         int64                   // Lamport logical clock
+	state         NodeState               // RELEASED, WANTED, HELD
+	requestTime   int64                   // Timestamp when CS was requested
+	peers         map[int32]string        // Other nodes' addresses
+	replies       []int32                 // Nodes that sent OK
+	deferredQueue []*deferredRequest      // Requests to reply to later
+	mu            sync.Mutex              // Protects shared state
 	pro.UnimplementedMutualExclusionServer
 }
 
@@ -35,7 +38,7 @@ func NewNode(id int32, address string, peers map[int32]string) *Node {
 		state:         RELEASED,
 		peers:         peers,
 		replies:       []int32{},
-		deferredQueue: []int32{},
+		deferredQueue: []*deferredRequest{},
 	}
 }
 
@@ -70,7 +73,6 @@ func (n *Node) RequestAccess(ctx context.Context, req *pro.Request) (*pro.Reply,
 	n.updateClock(req.Timestamp)
 
 	n.mu.Lock()
-	defer n.mu.Unlock()
 
 	needToReply := false
 
@@ -83,20 +85,31 @@ func (n *Node) RequestAccess(ctx context.Context, req *pro.Request) (*pro.Reply,
 		} else if (req.Timestamp == n.requestTime) && (req.NodeId < n.id) {
 			needToReply = true
 		} else {
-			// We have higher priority. We defer the request by putting the request in the queue
-			n.deferredQueue = append(n.deferredQueue, req.NodeId)
+			// We have higher priority. Defer the request by blocking until we reply later
+			needToReply = false
 		}
-	} else { // State = HELD. Same idea
-		n.deferredQueue = append(n.deferredQueue, req.NodeId)
+	} else { // State = HELD. Defer the request
+		needToReply = false
 	}
 
 	if needToReply {
 		n.clock++
-		return &pro.Reply{NodeId: n.id, Timestamp: n.clock}, nil
+		reply := &pro.Reply{NodeId: n.id, Timestamp: n.clock}
+		n.mu.Unlock()
+		return reply, nil
 	}
 
-	return nil, status.Error(codes.Unavailable, "Request deferred")
+	// Defer the request - create a channel and block until we're ready to reply
+	replyCh := make(chan *pro.Reply, 1)
+	n.deferredQueue = append(n.deferredQueue, &deferredRequest{
+		nodeId:  req.NodeId,
+		replyCh: replyCh,
+	})
+	n.mu.Unlock()
 
+	// Block and wait for the reply to be sent when we exit CS
+	reply := <-replyCh
+	return reply, nil
 }
 func (n *Node) RequestCS() {
 
@@ -141,7 +154,16 @@ func (n *Node) ReleaseCS() {
 	n.mu.Lock()
 	log.Printf("[Node %d] - LEAVING Critical section", n.id)
 	n.state = RELEASED
-	n.deferredQueue = []int32{}
+
+	// Send replies to all deferred requests
+	for _, req := range n.deferredQueue {
+		n.clock++
+		reply := &pro.Reply{NodeId: n.id, Timestamp: n.clock}
+		req.replyCh <- reply
+		log.Printf("[Node %d] - Sent deferred OK to Node %d", n.id, req.nodeId)
+	}
+
+	n.deferredQueue = []*deferredRequest{}
 	n.mu.Unlock()
 }
 
@@ -163,22 +185,19 @@ func (n *Node) sendRequest(peerID int32, peerAddr string) {
 	timestamp := n.requestTime
 	n.mu.Unlock()
 
-	// Keep retrying until we get a reply (handles deferred requests)
-	for {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		reply, err := client.RequestAccess(ctx, &pro.Request{NodeId: n.id, Timestamp: timestamp})
-		cancel()
+	// Send request once and wait for reply (peer will reply later if deferred)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
-		if err == nil && reply != nil {
-			n.mu.Lock()
-			n.replies = append(n.replies, reply.NodeId)
-			n.mu.Unlock()
-			log.Printf("[Node %d] - Received OK from Node %d", n.id, peerID)
-			return
-		}
+	reply, err := client.RequestAccess(ctx, &pro.Request{NodeId: n.id, Timestamp: timestamp})
 
-		// Request was deferred, wait a bit and retry
-		time.Sleep(100 * time.Millisecond)
+	if err == nil && reply != nil {
+		n.mu.Lock()
+		n.replies = append(n.replies, reply.NodeId)
+		n.mu.Unlock()
+		log.Printf("[Node %d] - Received OK from Node %d", n.id, peerID)
+	} else {
+		log.Printf("[Node %d] - Error receiving reply from Node %d: %v", n.id, peerID, err)
 	}
 }
 
